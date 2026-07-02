@@ -1,0 +1,23 @@
+len node_info 543
+adjust net size = 693
+
+LLM-order head-to-head: adaptec1  budget=300 outer=10 init=60 top_n=-1 seeds=3
+MaskPlace HPWL=6.5560e+05
+
+  plain         seed=0 HPWL=6.2712e+05 legal=True decodes=300 llm_calls=0
+  plain         seed=1 HPWL=6.2674e+05 legal=True decodes=300 llm_calls=0
+  plain         seed=2 HPWL=6.1969e+05 legal=True decodes=300 llm_calls=0
+  random_order  seed=0 HPWL=6.2492e+05 legal=True decodes=300 llm_calls=0
+  random_order  seed=1 HPWL=6.3066e+05 legal=True decodes=300 llm_calls=0
+  random_order  seed=2 HPWL=6.2622e+05 legal=True decodes=300 llm_calls=0
+  llm_order     seed=0 HPWL=6.3845e+05 legal=True decodes=300 llm_calls=10
+  llm_order     seed=1 HPWL=6.0758e+05 legal=True decodes=300 llm_calls=10
+  llm_order     seed=2 HPWL=6.0150e+05 legal=True decodes=300 llm_calls=10
+
+=== summary (adaptec1, matched budget 300 decodes) ===
+method                   HPWL mean+-std  legal  vs plain  vs MaskPlace
+plain           6.2452e+05+-3.42e+03   True     +0.0%         +4.7%
+random_order    6.2727e+05+-2.46e+03   True     -0.4%         +4.3%
+llm_order       6.1585e+05+-1.62e+04   True     +1.4%         +6.1%
+
+wall=86826s

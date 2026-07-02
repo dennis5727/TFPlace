@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.ipynb_checkpoints/
+.venv/
+venv/
+
+# Secrets
+.env
+*.env
+
+# OS
+.DS_Store
+
+# WireMask-BBO pipeline: adaptec1 netlist data is a real in-repo copy (self-contained).
+# Ignore only ariane data (large / needs protobuf<=3.20) and regenerated run outputs.
+external/WireMask-BBO/benchmark/ariane/
+external/WireMask-BBO/result/EA_swap_only/
+external/WireMask-BBO/result/RS/
+external/WireMask-BBO/placement_visualization/
