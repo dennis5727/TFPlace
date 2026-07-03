@@ -102,6 +102,32 @@ plain at matched budget, i.e. the order lever has real signal. Tiny-budget/1-see
 conclusive; run the full multi-seed head-to-head (incl. `llm_order`) to compare the LLM
 against this random-order control.
 
+## Deep LLM-order variant (`run_llm_order_deep.py`)
+
+A second, heavier driver that answers a sharper question: instead of scoring each
+LLM-proposed order by a *single* decode under one frozen coordinate set (as
+`run_llm_order.py` does during its cheap order search), **every** proposed order gets its
+own **full coordinate search** (`--n_init` random-init decodes + `--n_ea` swap-only
+(1+1)-EA rounds = 400 decodes/order by default). It loops up to `--max_calls` LLM
+proposals on **one seed**, keeps the best HPWL across proposals, and stops after
+`--patience` non-improving calls. This removes the "an order that looks best under one
+coord set may not survive full refinement" confound behind `llm_order`'s seed variance.
+
+`llm_order`-only; reuses the paper's decoder and the `order_advisor` helpers unchanged.
+Every call is logged (text + PNG plots: per-call coord-EA convergence, best-HPWL-vs-call,
+final placement) under `results/<run>/` (gitignored). LLM cost is tracked and printed
+(warn-only at $1.55; opus-4.8 ≈ $5/$25 per MTok, so ~30 calls is well within budget).
+
+```bash
+# free plumbing test (random edits stand in for the LLM; no API key):
+python run_llm_order_deep.py --mock --max_calls 3 --n_init 5 --n_ea 5
+# the experiment (needs ANTHROPIC_API_KEY in TFPlace/.env):
+python run_llm_order_deep.py --max_calls 30 --patience 5 --n_init 100 --n_ea 300 \
+    --model claude-opus-4-8
+```
+
+At ~4s/decode a full 30-call run is ~13h — intended for a lab PC, not a bounded notebook.
+
 ### Reproduced result (adaptec1, seed 2023, 100 init + 400 EA = 500 evals)
 | method | HPWL (their units) | legal |
 |---|---|---|
