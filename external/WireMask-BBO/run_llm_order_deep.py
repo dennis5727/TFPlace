@@ -289,9 +289,12 @@ def run_deep(args):
         cost = advisor_cost(advisor, args.model)
         warn = "  !! OVER BUDGET" if cost > BUDGET_WARN else ""
         calls_n = getattr(advisor, "calls", 0) if advisor else 0
-        log(f"call {call:2d}  moves={str(moves):<28.28s} HPWL={hpwl:.4e}  "
-            f"{'ACCEPT' if accepted else 'reject'}  running_best={best_hpwl:.4e}  "
-            f"decodes={total_decodes}  llm_calls={calls_n}  ${cost:.3f}{warn}", fh)
+        log(f"call {call:2d}  n_moves={len(moves):<2d} moves={str(moves):<28.28s} "
+            f"HPWL={hpwl:.4e}  {'ACCEPT' if accepted else 'reject'}  "
+            f"running_best={best_hpwl:.4e}  decodes={total_decodes}  "
+            f"llm_calls={calls_n}  ${cost:.3f}{warn}", fh)
+        fh.write(f"    full moves (call {call}, {len(moves)} edits): {moves}\n")
+        fh.flush()
         plot_convergence(traj, call, args.n_init, hpwl, accepted, outdir)
         plot_best_vs_call(rows, mp, outdir)
 
