@@ -32,6 +32,7 @@ import time
 
 import place_db
 import utils
+import warm_start
 from common import grid_setting, my_inf
 from wm_common import quiet, count_overlaps, maskplace_hpwl, load_env
 import order_advisor as oa
@@ -42,12 +43,17 @@ def _decode(order, placedb, gn, gs, rec):
     return quiet(utils.greedy_placer_with_init_coordinate, order, placedb, gn, gs, rec)
 
 
-def coordinate_ea(order, placedb, gn, gs, n_init, n_ea, rng):
-    """Paper's coordinate search on a FIXED decode ``order``: n_init random-init
-    decodes (keep best) + n_ea swap-only (1+1)-EA rounds. Returns (placed, hpwl, decodes)."""
+def coordinate_ea(order, placedb, gn, gs, n_init, n_ea, rng, init_fn=None, jitter=8):
+    """Paper's coordinate search on a FIXED decode ``order``: n_init init decodes
+    (keep best) + n_ea swap-only (1+1)-EA rounds. ``init_fn`` selects the hint source:
+    None = utils.random_guiding (noise); else warm_start.connectivity_guiding (spectral,
+    first draw jitter 0, rest jittered for diversity). Returns (placed, hpwl, decodes)."""
     best_hpwl, best_rec, best_placed = my_inf, None, None
-    for _ in range(n_init):
-        rec = quiet(utils.random_guiding, order, placedb, gn, gs)
+    for k in range(n_init):
+        if init_fn is None:
+            rec = quiet(utils.random_guiding, order, placedb, gn, gs)
+        else:
+            rec = quiet(init_fn, order, placedb, gn, gs, rng, 0 if k == 0 else jitter)
         placed, hpwl = _decode(order, placedb, gn, gs, rec)
         if hpwl < best_hpwl:
             best_hpwl, best_rec, best_placed = hpwl, rec, placed
@@ -116,7 +122,7 @@ def outer_order_search(method, placedb, gn, gs, base_order, hubs, rounds, rng,
 
 
 def run_once(method, placedb, dataset, gn, gs, budget, outer, init_round, seed,
-             model, max_moves, top_n, n_links):
+             model, max_moves, top_n, n_links, init_fn=None, jitter=8):
     random.seed(seed)
     base_order = utils.rank_macros(placedb)
     # top_n <= 0 -> give the LLM the WHOLE netlist (every macro is reorderable).
@@ -134,7 +140,8 @@ def run_once(method, placedb, dataset, gn, gs, budget, outer, init_round, seed,
     inner = budget - outer_used
     n_init = min(init_round, max(1, inner))
     n_ea = max(0, inner - n_init)
-    placed, hpwl, inner_used = coordinate_ea(order, placedb, gn, gs, n_init, n_ea, rng)
+    placed, hpwl, inner_used = coordinate_ea(order, placedb, gn, gs, n_init, n_ea, rng,
+                                             init_fn, jitter)
     ov = count_overlaps(placed)
     return {
         "method": method, "hpwl": hpwl, "legal": ov == 0, "overlaps": ov,
@@ -158,7 +165,12 @@ def main():
                     help="how many of the strongest macro-macro links to show the LLM")
     ap.add_argument("--methods", nargs="+", default=["plain", "random_order", "llm_order"])
     ap.add_argument("--model", default="claude-sonnet-4-6")
-    ap.add_argument("--max_moves", type=int, default=8)
+    ap.add_argument("--max_moves", type=int, default=6,
+                    help="max order-edits per call; LLM is told to use only as many as help")
+    ap.add_argument("--init", choices=["random", "spectral"], default="random",
+                    help="coordinate-hint source: random noise or spectral warm start")
+    ap.add_argument("--jitter", type=int, default=8,
+                    help="spectral per-draw offset (cells) for best-of-N diversity")
     args = ap.parse_args()
 
     load_env()  # pick up ANTHROPIC_API_KEY from TFPlace/.env if present
@@ -166,6 +178,7 @@ def main():
     gn = grid_setting[args.dataset]["grid_num"]
     gs = grid_setting[args.dataset]["grid_size"]
     mp = maskplace_hpwl(placedb, args.dataset)
+    init_fn = warm_start.connectivity_guiding if args.init == "spectral" else None
 
     print(f"\nLLM-order head-to-head: {args.dataset}  budget={args.budget} "
           f"outer={args.outer} init={args.init_round} top_n={args.top_n} "
@@ -177,7 +190,7 @@ def main():
         for seed in range(args.seeds):
             r = run_once(method, placedb, args.dataset, gn, gs, args.budget, args.outer,
                          args.init_round, 1000 + seed, args.model, args.max_moves,
-                         args.top_n, args.links)
+                         args.top_n, args.links, init_fn, args.jitter)
             results[method].append(r)
             print(f"  {method:13s} seed={seed} HPWL={r['hpwl']:.4e} legal={r['legal']} "
                   f"decodes={r['decodes']} llm_calls={r['llm_calls']}")

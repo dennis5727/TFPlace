@@ -127,11 +127,13 @@ class OrderAdvisor:
         "connected hub pairs that ended up FAR APART in the current layout. You improve the "
         "ORDER with a FEW targeted moves -- each move places one macro immediately before "
         "another in the order -- to pull connected hubs together, without reshuffling the "
-        "rest. You always answer with a single JSON list of [a, b] integer pairs."
+        "rest. Use the FEWEST moves that actually help: if a single move improves the "
+        "layout, propose just that one move; never pad the list up to the maximum. "
+        "You always answer with a single JSON list of [a, b] integer pairs."
     )
 
     def __init__(self, summary, n_hubs, model="claude-sonnet-4-6", max_tokens=1500,
-                 max_retries=2, api_key=None, max_moves=8):
+                 max_retries=2, api_key=None, max_moves=6):
         import anthropic
         self.client = anthropic.Anthropic(api_key=api_key or os.environ.get("ANTHROPIC_API_KEY"))
         self.summary = summary
@@ -151,12 +153,14 @@ class OrderAdvisor:
             f"{feedback}\n\n"
             "=== YOUR TASK ===\n"
             f"Current best LEGAL HPWL: {best_hpwl:.4e} (lower is better).\n"
-            f"Propose 1 to {self.max_moves} targeted moves to pull far-apart connected hubs "
-            "together in the decode order. Each move is a pair [a, b] meaning 'place macro a "
-            "immediately before macro b in the order'. Prefer moving the less-connected macro "
-            "of a far-apart pair next to the more-connected one. Do NOT repeat a move set that "
-            "was rejected; build on accepted ones. Think briefly, then output ONLY a JSON list "
-            "of pairs, e.g. [[12,5],[30,5]]."
+            f"Propose between 1 and {self.max_moves} targeted moves to pull far-apart connected "
+            "hubs together in the decode order -- but use ONLY as many as actually help: if one "
+            "move is enough, return just one; do not pad up to the maximum. Each move is a pair "
+            "[a, b] meaning 'place macro a immediately before macro b in the order'. Prefer "
+            "moving the less-connected macro of a far-apart pair next to the more-connected one. "
+            "Do NOT repeat a move set that was rejected; build on accepted ones. Think briefly, "
+            "then output ONLY a JSON list of pairs, e.g. [[12,5]] for a single move or "
+            "[[12,5],[30,5]] for two."
         )
 
     @staticmethod
