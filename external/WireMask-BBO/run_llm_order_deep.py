@@ -34,7 +34,6 @@ from collections import Counter
 
 import place_db
 import utils
-import warm_start
 from common import grid_setting, my_inf
 from wm_common import quiet, count_overlaps, maskplace_hpwl, load_env
 import order_advisor as oa
@@ -69,24 +68,17 @@ def _decode(order, placedb, gn, gs, rec):
     return quiet(utils.greedy_placer_with_init_coordinate, order, placedb, gn, gs, rec)
 
 
-def coordinate_ea_traced(order, placedb, gn, gs, n_init, n_ea, rng,
-                         init_fn=None, jitter=8):
+def coordinate_ea_traced(order, placedb, gn, gs, n_init, n_ea, rng):
     """Paper's coordinate search on a FIXED decode ``order``, WITH a trajectory.
 
-    n_init init decodes (keep best) + n_ea swap-only (1+1)-EA rounds (revert on reject).
-    ``init_fn`` selects the coordinate-hint source: None = utils.random_guiding (noise);
-    otherwise warm_start.connectivity_guiding (spectral). The first draw uses jitter 0
-    (pure warm start); the rest jitter for best-of-N diversity. Returns (best_placed,
-    best_hpwl, trajectory) where trajectory is (decode_idx, phase, best_hpwl_so_far),
-    phase in {"init", "ea"} -- for plotting."""
+    n_init random-init decodes (keep best) + n_ea swap-only (1+1)-EA rounds (revert on
+    reject). Returns (best_placed, best_hpwl, trajectory) where trajectory is
+    (decode_idx, phase, best_hpwl_so_far), phase in {"init", "ea"} -- for plotting."""
     best_hpwl, best_rec, best_placed = my_inf, None, None
     traj = []
     idx = 0
     for k in range(n_init):
-        if init_fn is None:
-            rec = quiet(utils.random_guiding, order, placedb, gn, gs)
-        else:
-            rec = quiet(init_fn, order, placedb, gn, gs, rng, 0 if k == 0 else jitter)
+        rec = quiet(utils.random_guiding, order, placedb, gn, gs)
         placed, hpwl = _decode(order, placedb, gn, gs, rec)
         if hpwl < best_hpwl:
             best_hpwl, best_rec, best_placed = hpwl, rec, placed
@@ -240,7 +232,7 @@ def run_deep(args):
     mode = "MOCK (random edits, no API)" if args.mock else f"LLM ({args.model})"
     log(f"\n=== deep LLM-order : {args.dataset}  seed={args.seed} ===", fh)
     log(f"mode={mode}  max_calls={args.max_calls} patience={args.patience} "
-        f"n_init={args.n_init} n_ea={args.n_ea} (400/call) top_n={args.top_n} "
+        f"n_init={args.n_init} n_ea={args.n_ea} ({args.n_init + args.n_ea}/call) top_n={args.top_n} "
         f"hubs={n_hubs}", fh)
     if mp:
         log(f"MaskPlace HPWL = {mp:.4e}", fh)
@@ -252,16 +244,11 @@ def run_deep(args):
         advisor = oa.OrderAdvisor(summary, len(hubs), model=args.model,
                                   max_moves=args.max_moves)
 
-    # coordinate-hint source: random (noise) or spectral warm start
-    init_fn = warm_start.connectivity_guiding if args.init == "spectral" else None
-    log(f"init hint = {args.init}"
-        + (f" (jitter={args.jitter} cells)" if args.init == "spectral" else ""), fh)
-
     t0 = time.time()
 
     # --- call 0: baseline rank_macros order, full coord-EA (not an LLM call) ------
     placed, hpwl, traj = coordinate_ea_traced(
-        base_order, placedb, gn, gs, args.n_init, args.n_ea, rng, init_fn, args.jitter)
+        base_order, placedb, gn, gs, args.n_init, args.n_ea, rng)
     best_order, best_hpwl, best_placed = base_order, hpwl, placed
     total_decodes = args.n_init + args.n_ea
     history_text = [f"baseline rank_macros order: HPWL={best_hpwl:.4e}"]
@@ -294,7 +281,7 @@ def run_deep(args):
             break
 
         placed, hpwl, traj = coordinate_ea_traced(
-            order, placedb, gn, gs, args.n_init, args.n_ea, rng, init_fn, args.jitter)
+            order, placedb, gn, gs, args.n_init, args.n_ea, rng)
         total_decodes += args.n_init + args.n_ea
         accepted = hpwl < best_hpwl
         if accepted:
@@ -354,8 +341,8 @@ def main():
     ap.add_argument("--max_calls", type=int, default=15, help="max LLM order proposals")
     ap.add_argument("--patience", type=int, default=3,
                     help="stop after this many non-improving calls")
-    ap.add_argument("--n_init", type=int, default=100, help="init decodes / order")
-    ap.add_argument("--n_ea", type=int, default=300, help="swap-only EA rounds / order")
+    ap.add_argument("--n_init", type=int, default=100, help="random-init decodes / order")
+    ap.add_argument("--n_ea", type=int, default=500, help="swap-only EA rounds / order")
     ap.add_argument("--top_n", type=int, default=60,
                     help="macros the LLM may reorder (top-N hubs by degree); -1 = whole netlist")
     ap.add_argument("--links", type=int, default=120,
@@ -363,10 +350,6 @@ def main():
     ap.add_argument("--model", default="claude-opus-4-8")
     ap.add_argument("--max_moves", type=int, default=6,
                     help="max order-edits per call; LLM is told to use only as many as help")
-    ap.add_argument("--init", choices=["random", "spectral"], default="random",
-                    help="coordinate-hint source: random noise or spectral warm start")
-    ap.add_argument("--jitter", type=int, default=8,
-                    help="spectral per-draw offset (cells) for best-of-N diversity")
     ap.add_argument("--mock", action="store_true",
                     help="use random order-edits instead of the LLM (no API key/cost)")
     ap.add_argument("--outdir", default=None)
