@@ -27,6 +27,7 @@ Usage:
 """
 
 import argparse
+import json
 import os
 import random
 import time
@@ -107,6 +108,31 @@ def _links_for_feedback(placedb, hubs, n_links):
     for i, j, c in oa.macro_connections(placedb, hubs, top_k=n_links):
         out.append((i, j, c, hubs[i], hubs[j]))
     return out
+
+
+def build_history_block(trials, baseline_hpwl):
+    """Full per-trial history for the LLM: one section per attempt (oldest first),
+    each with its edit list, HPWL, delta vs baseline, and the connected hub pairs that
+    stayed far apart in THAT attempt's own layout. ``trials`` are the records built in
+    run_deep (``moves`` is None for the baseline attempt)."""
+    secs = []
+    for t in trials:
+        if t["moves"] is None:  # attempt 0 = baseline rank_macros order
+            head = "=== ATTEMPT 0: baseline rank_macros order ==="
+            moves_line = "moves: (none)"
+            hpwl_line = f"HPWL: {t['hpwl']:.4e}"
+        else:
+            tag = "ACCEPTED: new best" if t["accepted"] else "REJECTED: did not beat best"
+            head = f"=== ATTEMPT {t['call']}  [{tag}] ==="
+            moves_line = f"moves: {t['moves']}"
+            delta = 100.0 * (t["hpwl"] - baseline_hpwl) / baseline_hpwl
+            hpwl_line = f"HPWL: {t['hpwl']:.4e}   ({delta:+.1f}% vs baseline)"
+        secs.append("\n".join([
+            head, moves_line, hpwl_line,
+            "far-apart connected hubs in THIS layout:",
+            "  " + t["far"],
+        ]))
+    return "\n\n".join(secs)
 
 
 # --------------------------------------------------------------------------- #
@@ -219,6 +245,8 @@ def run_deep(args):
     os.makedirs(outdir, exist_ok=True)
     fh = open(os.path.join(outdir, "run.log"), "w")
 
+    jsonl_fh = open(os.path.join(outdir, "llm_calls.jsonl"), "w")
+
     placedb = place_db.PlaceDB(args.dataset)
     gn = grid_setting[args.dataset]["grid_num"]
     gs = grid_setting[args.dataset]["grid_size"]
@@ -249,9 +277,14 @@ def run_deep(args):
     # --- call 0: baseline rank_macros order, full coord-EA (not an LLM call) ------
     placed, hpwl, traj = coordinate_ea_traced(
         base_order, placedb, gn, gs, args.n_init, args.n_ea, rng)
-    best_order, best_hpwl, best_placed = base_order, hpwl, placed
+    best_hpwl, best_placed = hpwl, placed
+    best_moves = []              # winning edit list (empty = baseline unbeaten)
+    baseline_hpwl = hpwl         # reference for the per-trial "% vs baseline" deltas
     total_decodes = args.n_init + args.n_ea
-    history_text = [f"baseline rank_macros order: HPWL={best_hpwl:.4e}"]
+    # per-trial history the LLM reasons over: each attempt's moves, HPWL, accept flag,
+    # and the far-apart connected hubs in ITS OWN layout (not the incumbent's).
+    trials = [{"call": 0, "moves": None, "hpwl": hpwl, "accepted": True,
+               "far": oa.far_apart_pairs(placed, links)}]
     rows = [{"call": 0, "moves": "(baseline)", "hpwl": hpwl, "accepted": True,
              "running_best": best_hpwl}]
     log(f"call  0  baseline           HPWL={hpwl:.4e}  running_best={best_hpwl:.4e}  "
@@ -263,15 +296,27 @@ def run_deep(args):
     no_improve = 0
     seen_orders = Counter()   # de-dup: stop if the same resulting order is proposed 3x
     for call in range(1, args.max_calls + 1):
-        fb = "LONG CONNECTIONS: " + oa.far_apart_pairs(best_placed, links)
         if args.mock:
+            # no-LLM control: 3 random [a,b] edits on the baseline (no history mechanism)
             moves = oa.random_order_control_edits(len(hubs), rng, n_moves=3)
         else:
-            moves = advisor.suggest(best_hpwl, "\n".join(history_text), fb)
+            history_block = build_history_block(trials, baseline_hpwl)
+            moves, user_msg, attempts = advisor.suggest(best_hpwl, history_block)
+            # audit trail: one JSONL record per API call (incl. failed/retried attempts),
+            # carrying the exact user message and the raw response text.
+            for att in attempts:
+                rec = {"call": call, "user_message": user_msg}
+                rec.update(att)
+                jsonl_fh.write(json.dumps(rec) + "\n")
+            jsonl_fh.flush()
+            if any(a.get("stop_reason") == "max_tokens" for a in attempts):
+                log(f"call {call:2d}  !! WARNING: an LLM response was truncated at "
+                    "max_tokens (see llm_calls.jsonl)", fh)
             if not moves:
                 log(f"call {call:2d}  LLM returned no moves -> stopping.", fh)
                 break
 
+        moves_disp = [list(m) for m in moves]
         order = oa.apply_order_edits(base_order, moves, hubs)
         # stop BEFORE spending init+ea if the LLM keeps handing back the same order
         seen_orders[tuple(order)] += 1
@@ -285,24 +330,24 @@ def run_deep(args):
         total_decodes += args.n_init + args.n_ea
         accepted = hpwl < best_hpwl
         if accepted:
-            best_order, best_hpwl, best_placed = order, hpwl, placed
+            best_moves, best_hpwl, best_placed = moves_disp, hpwl, placed
             no_improve = 0
         else:
             no_improve += 1
-        history_text.append(
-            f"moves={moves} -> HPWL={hpwl:.4e} "
-            f"({'accepted' if accepted else 'rejected'})")
-        rows.append({"call": call, "moves": str(moves), "hpwl": hpwl,
+        # record THIS trial's own far-apart geometry (what the LLM will see next call)
+        trials.append({"call": call, "moves": moves_disp, "hpwl": hpwl,
+                       "accepted": accepted, "far": oa.far_apart_pairs(placed, links)})
+        rows.append({"call": call, "moves": str(moves_disp), "hpwl": hpwl,
                      "accepted": accepted, "running_best": best_hpwl})
 
         cost = advisor_cost(advisor, args.model)
         warn = "  !! OVER BUDGET" if cost > BUDGET_WARN else ""
         calls_n = getattr(advisor, "calls", 0) if advisor else 0
-        log(f"call {call:2d}  n_moves={len(moves):<2d} moves={str(moves):<28.28s} "
+        log(f"call {call:2d}  n_moves={len(moves):<2d} moves={str(moves_disp):<28.28s} "
             f"HPWL={hpwl:.4e}  {'ACCEPT' if accepted else 'reject'}  "
             f"running_best={best_hpwl:.4e}  decodes={total_decodes}  "
             f"llm_calls={calls_n}  ${cost:.3f}{warn}", fh)
-        fh.write(f"    full moves (call {call}, {len(moves)} edits): {moves}\n")
+        fh.write(f"    full moves (call {call}, {len(moves)} edits): {moves_disp}\n")
         fh.flush()
         plot_convergence(traj, call, args.n_init, hpwl, accepted, outdir)
         plot_best_vs_call(rows, mp, outdir)
@@ -330,7 +375,10 @@ def run_deep(args):
             f"out={advisor.out_tokens} cache_read={advisor.cache_read_tokens}", fh)
         log(f"approx LLM cost    : ${cost:.3f}  (budget ${BUDGET_WARN})", fh)
     log(f"wall               : {time.time()-t0:.0f}s", fh)
-    log(f"artifacts          : {outdir}/ (run.log, *.png, best_placement.pl)", fh)
+    # the winning decode order as a replayable recipe: baseline + the accepted edits
+    log(f"winning order = rank_macros + {best_moves}", fh)
+    log(f"artifacts          : {outdir}/ (run.log, llm_calls.jsonl, *.png, best_placement.pl)", fh)
+    jsonl_fh.close()
     fh.close()
 
 

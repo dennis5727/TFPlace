@@ -12,7 +12,6 @@ coordinates or overrides the greedy, so legality stays automatic.
 """
 
 import os
-import re
 from itertools import combinations
 
 
@@ -114,25 +113,69 @@ def random_order_control_edits(n_hubs, rng, n_moves):
 # --------------------------------------------------------------------------- #
 # the LLM advisor (mirrors tfplace/engine/integrated_search.py::PromoteAdvisor)
 # --------------------------------------------------------------------------- #
+# The model answers by CALLING this tool, not by writing JSON in prose. That keeps
+# its free-text reasoning (in a `text` block) structurally separate from its answer
+# (in the `tool_use` block), so pairs written while thinking can never leak into the
+# parsed move list -- the fix for the "scratchpad read as the answer" bug.
+PROPOSE_MOVES_TOOL = {
+    "name": "propose_moves",
+    "description": (
+        "Submit your chosen decode-order edits for THIS attempt. Each edit is a pair "
+        "[a, b] meaning 'place hub macro a immediately before hub macro b' in the fixed "
+        "baseline order. Provide between 1 and the allowed maximum edits; use the fewest "
+        "that actually help. Call this exactly once, with your final answer."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "moves": {
+                "type": "array",
+                "description": "List of [a, b] integer hub-id pairs (a != b).",
+                "items": {
+                    "type": "array",
+                    "items": {"type": "integer"},
+                    "minItems": 2,
+                    "maxItems": 2,
+                },
+            },
+        },
+        "required": ["moves"],
+    },
+}
+
+
 class OrderAdvisor:
-    """Anthropic-backed advisor: proposes a FEW [a,b] order-edits that pull
-    strongly-connected hub macros earlier/together in the greedy DECODE ORDER."""
+    """Anthropic-backed advisor: reasons over the FULL trial history and proposes a
+    FEW [a, b] order-edits (via the ``propose_moves`` tool) that pull strongly-connected
+    hub macros together in the greedy DECODE ORDER.
+
+    Every attempt is the baseline ``rank_macros`` order + the proposed edits (edits never
+    stack on the previous attempt); the advisor is shown all past attempts with their HPWL
+    and per-layout far-apart hubs, and answers by calling the tool -- so its reasoning text
+    can never contaminate the parsed answer."""
 
     SYSTEM = (
-        "You are an expert chip floorplanning assistant. A training-free greedy placer "
-        "places macros ONE AT A TIME in a given ORDER; a macro placed earlier claims the "
-        "best low-wirelength location, and placing two strongly-connected macros close "
-        "together in the order tends to place them physically close. You are given a good "
-        "baseline order (macros already sorted by size/connectivity) and the strongly-"
-        "connected hub pairs that ended up FAR APART in the current layout. You improve the "
-        "ORDER with a FEW targeted moves -- each move places one macro immediately before "
-        "another in the order -- to pull connected hubs together, without reshuffling the "
-        "rest. Use the FEWEST moves that actually help: if a single move improves the "
-        "layout, propose just that one move; never pad the list up to the maximum. "
-        "You always answer with a single JSON list of [a, b] integer pairs."
+        "You are an expert chip floorplanning assistant guiding a training-free greedy "
+        "placer. The placer places macros ONE AT A TIME in a decode ORDER; a macro placed "
+        "earlier claims the best low-wirelength location first, so placing two strongly-"
+        "connected macros near each other in the ORDER tends to place them physically close. "
+        "You set the order by editing a FIXED baseline order (macros pre-sorted by "
+        "size/connectivity, called rank_macros). Each edit is a pair [a, b] meaning 'place "
+        "hub macro a immediately before hub macro b'.\n\n"
+        "CRUCIAL: every attempt is INDEPENDENT. Your edits are ALWAYS applied to the same "
+        "fixed baseline order -- never to your previous attempt. Nothing carries over "
+        "automatically: if an edit from an earlier attempt helped and you want to keep it, "
+        "you MUST include it again in this attempt's list.\n\n"
+        "You are shown every attempt you have made: its exact edit list, the HPWL it produced "
+        "(lower is better), and which strongly-connected hub pairs stayed FAR APART in THAT "
+        "attempt's own layout. Reason over the whole history -- which edits lowered HPWL, "
+        "which raised it, which hub pairs stayed stubbornly far apart -- to choose the next "
+        "edit set. Use the FEWEST edits that actually help; never pad up to the maximum, and "
+        "never re-propose an edit set identical to one already tried. You answer by calling "
+        "the propose_moves tool."
     )
 
-    def __init__(self, summary, n_hubs, model="claude-sonnet-4-6", max_tokens=1500,
+    def __init__(self, summary, n_hubs, model="claude-sonnet-4-6", max_tokens=4096,
                  max_retries=2, api_key=None, max_moves=6):
         import anthropic
         self.client = anthropic.Anthropic(api_key=api_key or os.environ.get("ANTHROPIC_API_KEY"))
@@ -144,36 +187,57 @@ class OrderAdvisor:
         self.max_moves = max_moves
         self.calls = self.in_tokens = self.out_tokens = self.cache_read_tokens = 0
 
-    def _user_msg(self, best_hpwl, history_text, feedback):
+    def _user_msg(self, best_hpwl, history_block):
         return (
-            f"There are {self.n} hub macros with ids M0..M{self.n-1} (see summary).\n\n"
-            "=== ORDER MOVES TRIED SO FAR ===\n"
-            f"{history_text}\n\n"
-            "=== STRONGLY-CONNECTED HUBS THAT ARE FAR APART RIGHT NOW ===\n"
-            f"{feedback}\n\n"
+            f"There are {self.n} hub macros with ids M0..M{self.n-1} (their sizes, degrees, "
+            "and strongest connections are in the summary above).\n\n"
+            "=== FULL TRIAL HISTORY ===\n"
+            "(Every attempt below is the baseline rank_macros order with ONLY the listed "
+            "edits applied -- attempts do NOT build on each other.)\n\n"
+            f"{history_block}\n\n"
             "=== YOUR TASK ===\n"
-            f"Current best LEGAL HPWL: {best_hpwl:.4e} (lower is better).\n"
-            f"Propose between 1 and {self.max_moves} targeted moves to pull far-apart connected "
-            "hubs together in the decode order -- but use ONLY as many as actually help: if one "
-            "move is enough, return just one; do not pad up to the maximum. Each move is a pair "
-            "[a, b] meaning 'place macro a immediately before macro b in the order'. Prefer "
-            "moving the less-connected macro of a far-apart pair next to the more-connected one. "
-            "Do NOT repeat a move set that was rejected; build on accepted ones. Think briefly, "
-            "then output ONLY a JSON list of pairs, e.g. [[12,5]] for a single move or "
-            "[[12,5],[30,5]] for two."
+            f"Current best LEGAL HPWL so far: {best_hpwl:.4e} (lower is better).\n"
+            f"Propose between 1 and {self.max_moves} edits, applied to the baseline order, to "
+            "pull far-apart connected hubs together. Each edit is a pair [a, b] = 'place hub a "
+            "immediately before hub b'. Because every attempt restarts from the baseline, "
+            "include any earlier edit you want to keep. Use only as many edits as actually "
+            "help -- do not pad to the maximum, and do not repeat an edit set already tried. "
+            "Call the propose_moves tool with your chosen list of [a, b] pairs."
         )
 
     @staticmethod
-    def _parse_pairs(text, n):
-        out = []
-        for a, b in re.findall(r"\[\s*(\d+)\s*,\s*(\d+)\s*\]", text):
-            a, b = int(a), int(b)
-            if 0 <= a < n and 0 <= b < n and a != b:
-                out.append((a, b))
-        return out
+    def _moves_from_response(resp, n, max_moves):
+        """Extract validated [a, b] moves from the ``propose_moves`` tool_use block ONLY.
 
-    def suggest(self, best_hpwl, history_text, feedback):
-        msg = self._user_msg(best_hpwl, history_text, feedback)
+        Reads the structured tool input, never the free-text reasoning, so pairs the model
+        wrote (and maybe rejected) while thinking cannot leak in. Applies the validity
+        filter (0 <= a,b < n, a != b) and caps at ``max_moves``. Returns [(a, b), ...]."""
+        out = []
+        for block in getattr(resp, "content", None) or []:
+            if getattr(block, "type", "") != "tool_use" or getattr(block, "name", "") != "propose_moves":
+                continue
+            data = getattr(block, "input", None) or {}
+            for pair in data.get("moves", []) or []:
+                if not isinstance(pair, (list, tuple)) or len(pair) != 2:
+                    continue
+                try:
+                    a, b = int(pair[0]), int(pair[1])
+                except (TypeError, ValueError):
+                    continue
+                if 0 <= a < n and 0 <= b < n and a != b:
+                    out.append((a, b))
+        return out[:max_moves]
+
+    def suggest(self, best_hpwl, history_block):
+        """Ask the LLM for the next edit set, given the FULL trial history.
+
+        Returns (moves, user_msg, attempts):
+          - ``moves``    : list of (a, b) tuples, or None if no usable answer after retries.
+          - ``user_msg`` : the exact user message sent (for auditing / llm_calls.jsonl).
+          - ``attempts`` : one dict per API call (including failed/retried ones) with the
+            raw text, stop_reason, parsed moves, and token usage -- for llm_calls.jsonl."""
+        msg = self._user_msg(best_hpwl, history_block)
+        attempts = []
         for attempt in range(self.max_retries + 1):
             try:
                 resp = self.client.messages.create(
@@ -181,18 +245,36 @@ class OrderAdvisor:
                     system=[{"type": "text", "text": self.SYSTEM},
                             {"type": "text", "text": self.summary,
                              "cache_control": {"type": "ephemeral"}}],
+                    tools=[PROPOSE_MOVES_TOOL],
+                    tool_choice={"type": "auto"},
                     messages=[{"role": "user", "content": [{"type": "text", "text": msg}]}],
                 )
                 self.calls += 1
                 u = resp.usage
-                self.in_tokens += getattr(u, "input_tokens", 0)
-                self.out_tokens += getattr(u, "output_tokens", 0)
-                self.cache_read_tokens += getattr(u, "cache_read_input_tokens", 0) or 0
+                in_tok = getattr(u, "input_tokens", 0)
+                out_tok = getattr(u, "output_tokens", 0)
+                cache_read = getattr(u, "cache_read_input_tokens", 0) or 0
+                self.in_tokens += in_tok
+                self.out_tokens += out_tok
+                self.cache_read_tokens += cache_read
                 text = "".join(b.text for b in resp.content if getattr(b, "type", "") == "text")
-                moves = self._parse_pairs(text, self.n)[:self.max_moves]
+                stop = getattr(resp, "stop_reason", None)
+                moves = self._moves_from_response(resp, self.n, self.max_moves)
+                attempts.append({
+                    "model": self.model, "stop_reason": stop, "raw_text": text,
+                    "parsed_moves": [list(m) for m in moves],
+                    "usage": {"input_tokens": in_tok, "output_tokens": out_tok,
+                              "cache_read_input_tokens": cache_read},
+                })
+                if stop == "max_tokens":
+                    print(f"  [llm] !! WARNING attempt {attempt+1}: response TRUNCATED at "
+                          f"max_tokens={self.max_tokens} -- the answer may be incomplete; "
+                          "raise --max_tokens.")
                 if moves:
-                    return moves
-                print(f"  [llm] attempt {attempt+1}: no usable [a,b] pairs; retrying")
+                    return moves, msg, attempts
+                print(f"  [llm] attempt {attempt+1}: no propose_moves tool call / no valid "
+                      "pairs; retrying")
             except Exception as e:
+                attempts.append({"model": self.model, "error": str(e)})
                 print(f"  [llm] attempt {attempt+1} error: {e}")
-        return None
+        return None, msg, attempts
